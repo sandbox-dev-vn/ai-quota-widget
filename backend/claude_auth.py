@@ -215,10 +215,10 @@ def read_claude_file_oauth() -> tuple[str | None, str | None]:
         return None, None
 
 
-def read_claude_keyring_oauth() -> tuple[str | None, str | None]:
-    """Read Claude Code credentials from Windows Credential Manager (advapi32)."""
+def read_windows_credential_json(targets: list[str]) -> dict[str, Any] | None:
+    """Read the first JSON-encoded generic credential matching targets from Windows Credential Manager."""
     if sys.platform != "win32":
-        return None, None
+        return None
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     advapi32.CredReadW.argtypes = [
@@ -231,12 +231,7 @@ def read_claude_keyring_oauth() -> tuple[str | None, str | None]:
     advapi32.CredFree.argtypes = [ctypes.c_void_p]
 
     CRED_TYPE_GENERIC = 1
-    candidates = ["Claude Code-credentials"]
-    user = os.environ.get("USERNAME", "").strip()
-    if user:
-        candidates.append(f"Claude Code-credentials-{user}")
-
-    for target in candidates:
+    for target in targets:
         p_cred = ctypes.POINTER(_CREDENTIALW)()
         if not advapi32.CredReadW(target, CRED_TYPE_GENERIC, 0, ctypes.byref(p_cred)):
             continue
@@ -249,15 +244,39 @@ def read_claude_keyring_oauth() -> tuple[str | None, str | None]:
                 try:
                     text = blob.decode(encoding).strip("\x00").strip()
                     if text.startswith("{"):
-                        token, tier = _parse_claude_oauth_json(text)
-                        if token:
-                            return token, tier
+                        data = json.loads(text)
+                        if isinstance(data, dict):
+                            return data
                 except Exception:
                     continue
         finally:
             advapi32.CredFree(p_cred)
 
-    return None, None
+    return None
+
+
+def read_claude_keyring_oauth() -> tuple[str | None, str | None]:
+    """Read Claude Code credentials from Windows Credential Manager (advapi32)."""
+    candidates = ["Claude Code-credentials"]
+    user = os.environ.get("USERNAME", "").strip()
+    if user:
+        candidates.append(f"Claude Code-credentials-{user}")
+
+    data = read_windows_credential_json(candidates)
+    if not data:
+        return None, None
+    return _parse_claude_oauth_json(json.dumps(data))
+
+
+def read_antigravity_cli_oauth() -> dict[str, Any] | None:
+    """Read Antigravity CLI OAuth credentials from Windows Credential Manager."""
+    data = read_windows_credential_json(["gemini:antigravity"])
+    if not data:
+        return None
+    token_obj = data.get("token")
+    if isinstance(token_obj, dict) and str(token_obj.get("access_token") or "").strip():
+        return data
+    return None
 
 
 def _claude_desktop_store_dirs() -> list[Path]:

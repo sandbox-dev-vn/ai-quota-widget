@@ -20,6 +20,7 @@ import psutil
 
 from .claude_auth import (
     has_claude_desktop_installed,
+    read_antigravity_cli_oauth,
     read_claude_desktop_cookies,
     read_claude_file_oauth,
     read_claude_keyring_oauth,
@@ -485,6 +486,206 @@ def _parse_antigravity_user_status(
     return email, plan, badges, primary, secondary, extra_windows
 
 
+def _finalize_antigravity_online(
+    *,
+    source_text: str,
+    plan: str | None,
+    email: str | None,
+    primary: dict[str, Any] | None,
+    secondary: dict[str, Any] | None,
+    extra_windows: list[dict[str, Any]],
+    badges: list[dict[str, str]],
+) -> dict[str, Any]:
+    # Surface Argon right after Gemini 5h/Weekly, before 3p models
+    extra_windows.sort(
+        key=lambda w: (
+            0 if "argon" in w["label"].lower() else 1,
+            w["label"],
+        )
+    )
+    result = {
+        "id": "antigravity",
+        "name": "Antigravity",
+        "status": "online",
+        "status_text": source_text,
+        "plan": plan,
+        "account": email,
+        "primary": primary,
+        "secondary": secondary,
+        "extra_windows": extra_windows,
+        "badges": badges,
+        "error": None,
+        "updated_at": _now_iso(),
+    }
+    _LAST_ONLINE_SNAPSHOTS["antigravity"] = result
+    return result
+
+
+def _format_antigravity_cloud_plan(load_data: dict[str, Any]) -> str | None:
+    for key in ("paidTier", "currentTier"):
+        tier = load_data.get(key)
+        if not isinstance(tier, dict):
+            continue
+        t_id = str(tier.get("id") or "").lower()
+        t_name = str(tier.get("name") or "").strip()
+        if "ultra" in t_id or "ultra" in t_name.lower():
+            return "Ultra"
+        if "pro" in t_id or "pro" in t_name.lower():
+            return "Pro"
+        if "free" in t_id:
+            if key == "paidTier":
+                return "Free"
+            continue
+        if t_name:
+            return t_name
+    return None
+
+
+def _call_antigravity_cloud(
+    access_token: str,
+    method: str,
+    body: dict[str, Any],
+    hosts: tuple[str, ...] = ("daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"),
+) -> tuple[int, dict[str, Any] | None]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "antigravity/1.5.10 win32/amd64",
+    }
+    last_status = 0
+    for host in hosts:
+        try:
+            status, parsed, _ = _http_json(
+                f"https://{host}/v1internal:{method}",
+                method="POST",
+                headers=headers,
+                body=body,
+                timeout=6.0,
+            )
+            last_status = status
+            if status == 200 and isinstance(parsed, dict):
+                return 200, parsed
+            if status in (401, 403):
+                return status, None
+        except Exception:
+            continue
+    return last_status, None
+
+
+def _pick_bucket(buckets: list[dict[str, Any]], preferred_ids: tuple[str, ...], substring: str) -> dict[str, Any] | None:
+    by_id = {str(b.get("modelId") or "").lower(): b for b in buckets if isinstance(b, dict)}
+    for pid in preferred_ids:
+        b = by_id.get(pid)
+        if b and _extract_antigravity_remaining(b) is not None:
+            return b
+    for b in buckets:
+        if not isinstance(b, dict):
+            continue
+        mid = str(b.get("modelId") or "").lower()
+        if substring in mid and _extract_antigravity_remaining(b) is not None:
+            return b
+    return None
+
+
+def _fetch_antigravity_cloud(cred: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+    token_obj = cred.get("token") or {}
+    access_token = str(token_obj.get("access_token") or "").strip()
+    if not access_token:
+        return None, False
+
+    email = str(cred.get("id_token_email") or "").strip() or None
+    st_lc, load_data = _call_antigravity_cloud(
+        access_token,
+        "loadCodeAssist",
+        {"metadata": {"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}},
+    )
+    if st_lc in (401, 403):
+        return None, True
+
+    plan = _format_antigravity_cloud_plan(load_data) if isinstance(load_data, dict) else None
+    proj = (load_data or {}).get("cloudaicompanionProject") if isinstance(load_data, dict) else None
+    rpc_body: dict[str, Any] = {"project": proj} if proj else {}
+
+    st_sum, sum_data = _call_antigravity_cloud(access_token, "retrieveUserQuotaSummary", rpc_body)
+    if st_sum in (401, 403):
+        return None, True
+
+    primary: dict[str, Any] | None = None
+    secondary: dict[str, Any] | None = None
+    extra_windows: list[dict[str, Any]] = []
+    if st_sum == 200 and sum_data:
+        primary, secondary, extra_windows = _parse_antigravity_quota_summary(sum_data)
+
+    st_q, q_data = _call_antigravity_cloud(access_token, "retrieveUserQuota", rpc_body)
+    if st_q in (401, 403):
+        return None, True
+
+    buckets = (q_data or {}).get("buckets") or [] if isinstance(q_data, dict) else []
+    if isinstance(buckets, list):
+        if primary is None:
+            gem_b = _pick_bucket(
+                buckets,
+                ("gemini-4-hydrogen-sonar", "gemini-2.5-pro", "gemini-3-flash", "gemini-3.8-flash-tiered", "gemini-2.5-flash"),
+                "gemini-",
+            )
+            if gem_b:
+                rem = _extract_antigravity_remaining(gem_b)
+                if rem is not None:
+                    primary = _make_window(
+                        "Gemini 5h",
+                        remaining_fraction=rem,
+                        reset_dt=_parse_iso(gem_b.get("resetTime")),
+                        window_id="gemini-5h",
+                    )
+
+        if not any("argon" in w["label"].lower() for w in extra_windows):
+            arg_b = _pick_bucket(buckets, ("gemini-4-argon-high", "gemini-4-argon-medium", "gemini-4-argon-low"), "argon")
+            if arg_b:
+                rem = _extract_antigravity_remaining(arg_b)
+                if rem is not None:
+                    extra_windows.append(
+                        _make_window(
+                            "Gemini 4 Argon",
+                            remaining_fraction=rem,
+                            reset_dt=_parse_iso(arg_b.get("resetTime")),
+                            window_id="gemini-argon",
+                        )
+                    )
+
+        if not any("claude" in w["label"].lower() or "gpt" in w["label"].lower() for w in extra_windows):
+            tp_b = _pick_bucket(
+                buckets,
+                ("claude-opus-5-5-high", "claude-sonnet-5-5-high", "gpt-oss-120b-medium"),
+                "claude-",
+            )
+            if tp_b:
+                rem = _extract_antigravity_remaining(tp_b)
+                if rem is not None:
+                    extra_windows.append(
+                        _make_window(
+                            "Claude/GPT 5h",
+                            remaining_fraction=rem,
+                            reset_dt=_parse_iso(tp_b.get("resetTime")),
+                            window_id="3p-5h",
+                        )
+                    )
+
+    if primary is not None or secondary is not None or extra_windows:
+        return (
+            _finalize_antigravity_online(
+                source_text="agy CLI",
+                plan=plan,
+                email=email,
+                primary=primary,
+                secondary=secondary,
+                extra_windows=extra_windows,
+                badges=[],
+            ),
+            False,
+        )
+    return None, False
+
+
 def fetch_antigravity(settings: dict[str, Any]) -> dict[str, Any]:
     ssl_ctx = ssl._create_unverified_context()
     processes = _detect_antigravity_processes()
@@ -535,29 +736,22 @@ def fetch_antigravity(settings: dict[str, Any]) -> dict[str, Any]:
                         extra_windows = fb_extra
 
             if primary is not None or secondary is not None or extra_windows:
-                # Surface Argon right after Gemini 5h/Weekly, before 3p models
-                extra_windows.sort(
-                    key=lambda w: (
-                        0 if "argon" in w["label"].lower() else 1,
-                        w["label"],
-                    )
+                return _finalize_antigravity_online(
+                    source_text="Local IDE" if proc["source"] == "ide" else "agy CLI",
+                    plan=plan,
+                    email=email,
+                    primary=primary,
+                    secondary=secondary,
+                    extra_windows=extra_windows,
+                    badges=badges,
                 )
-                result = {
-                    "id": "antigravity",
-                    "name": "Antigravity",
-                    "status": "online",
-                    "status_text": "Local IDE" if proc["source"] == "ide" else "agy CLI",
-                    "plan": plan,
-                    "account": email,
-                    "primary": primary,
-                    "secondary": secondary,
-                    "extra_windows": extra_windows,
-                    "badges": badges,
-                    "error": None,
-                    "updated_at": _now_iso(),
-                }
-                _LAST_ONLINE_SNAPSHOTS["antigravity"] = result
-                return result
+
+    cli_cred = read_antigravity_cli_oauth()
+    cli_expired = False
+    if cli_cred:
+        cloud_res, cli_expired = _fetch_antigravity_cloud(cli_cred)
+        if cloud_res:
+            return cloud_res
 
     session_count = _count_antigravity_offline_sessions()
     cached = _LAST_ONLINE_SNAPSHOTS.get("antigravity")
@@ -565,7 +759,9 @@ def fetch_antigravity(settings: dict[str, Any]) -> dict[str, Any]:
         offline_copy = dict(cached)
         offline_copy["status"] = "offline"
         offline_copy["status_text"] = (
-            f"Offline · {session_count} phiên" if session_count else "Offline (IDE đang tắt)"
+            "Token CLI hết hạn"
+            if cli_expired
+            else f"Offline · {session_count} phiên" if session_count else "Offline (IDE đang tắt)"
         )
         offline_copy["updated_at"] = _now_iso()
         return offline_copy
@@ -573,19 +769,25 @@ def fetch_antigravity(settings: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": "antigravity",
         "name": "Antigravity",
-        "status": "offline",
+        "status": "error" if cli_expired else "offline",
         "status_text": (
-            f"Offline · {session_count} phiên" if session_count else "IDE chưa chạy"
+            "Token CLI hết hạn"
+            if cli_expired
+            else f"Offline · {session_count} phiên" if session_count else "IDE chưa chạy"
         ),
         "plan": None,
-        "account": None,
+        "account": str(cli_cred.get("id_token_email") or "").strip() or None if cli_cred else None,
         "primary": None,
         "secondary": None,
         "extra_windows": [],
         "badges": (
             [{"label": "Lịch sử", "value": f"{session_count} phiên"}] if session_count else []
         ),
-        "error": "Mở Antigravity IDE để đọc quota real-time từ Language Server.",
+        "error": (
+            "Token agy CLI đã hết hạn. Chạy `agy` để tự gia hạn hoặc mở Antigravity IDE."
+            if cli_expired
+            else "Mở Antigravity IDE hoặc đăng nhập `agy` CLI để đọc quota real-time."
+        ),
         "updated_at": _now_iso(),
     }
 
