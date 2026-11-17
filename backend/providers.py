@@ -427,6 +427,9 @@ def _parse_antigravity_quota_summary(
     return primary, secondary, extra_windows
 
 
+_EFFORT_SUFFIX_RE = re.compile(r"\s*\((?:low|medium|high|xhigh)\)\s*$", re.IGNORECASE)
+
+
 def _parse_antigravity_user_status(
     payload: dict[str, Any],
 ) -> tuple[str | None, str | None, list[dict[str, str]], dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]]]:
@@ -454,8 +457,11 @@ def _parse_antigravity_user_status(
         plan = us["userTier"].get("name") or us["userTier"].get("description")
 
     primary: dict[str, Any] | None = None
-    secondary: dict[str, Any] | None = None
+    argon_win: dict[str, Any] | None = None
+    third_party_win: dict[str, Any] | None = None
     extra_windows: list[dict[str, Any]] = []
+    seen_bases: set[str] = set()
+
     configs = (us.get("cascadeModelConfigData") or {}).get("clientModelConfigs") or []
     if isinstance(configs, list):
         for cfg in configs:
@@ -464,26 +470,53 @@ def _parse_antigravity_user_status(
             qi = cfg.get("quotaInfo")
             if not isinstance(qi, dict) or qi.get("remainingFraction") is None:
                 continue
-            label = str(cfg.get("label") or cfg.get("modelId") or "Model").strip()
+            raw_label = str(cfg.get("label") or cfg.get("modelId") or "Model").strip()
+            base_label = _EFFORT_SUFFIX_RE.sub("", raw_label).strip() or raw_label
+            lower = base_label.lower()
             rem = float(qi["remainingFraction"])
             reset_dt = _parse_iso(qi.get("resetTime"))
-            win = _make_window(
-                label,
-                remaining_fraction=rem,
-                reset_dt=reset_dt,
-                window_id=label.lower().replace(" ", "-"),
-            )
-            lower = label.lower()
-            if "argon" in lower:
-                extra_windows.append(win)
-            elif "claude" in lower and primary is None:
-                primary = win
-            elif "gemini" in lower and "pro" in lower and secondary is None:
-                secondary = win
-            elif len(extra_windows) < 6:
-                extra_windows.append(win)
 
-    return email, plan, badges, primary, secondary, extra_windows
+            if "argon" in lower:
+                if argon_win is None:
+                    argon_win = _make_window(
+                        "Gemini 4 Argon (7d)",
+                        remaining_fraction=rem,
+                        reset_dt=reset_dt,
+                        window_id="gemini-argon-wtu-weekly",
+                    )
+            elif "claude" in lower or "gpt" in lower:
+                if third_party_win is None:
+                    third_party_win = _make_window(
+                        "Claude/GPT 5h",
+                        remaining_fraction=rem,
+                        reset_dt=reset_dt,
+                        window_id="3p-5h",
+                    )
+            elif "gemini" in lower or "hydrogen" in lower or "flash" in lower:
+                if primary is None:
+                    primary = _make_window(
+                        "Gemini 5h",
+                        remaining_fraction=rem,
+                        reset_dt=reset_dt,
+                        window_id="gemini-5h",
+                    )
+            elif lower not in seen_bases and len(extra_windows) < 4:
+                seen_bases.add(lower)
+                extra_windows.append(
+                    _make_window(
+                        base_label,
+                        remaining_fraction=rem,
+                        reset_dt=reset_dt,
+                        window_id=lower.replace(" ", "-"),
+                    )
+                )
+
+    if argon_win is not None:
+        extra_windows.append(argon_win)
+    if third_party_win is not None:
+        extra_windows.append(third_party_win)
+
+    return email, plan, badges, primary, None, extra_windows
 
 
 def _finalize_antigravity_online(
@@ -699,8 +732,17 @@ def fetch_antigravity(settings: dict[str, Any]) -> dict[str, Any]:
                 {"forceRefresh": True},
                 tokens,
                 ssl_ctx,
-                timeout=2.5,
+                timeout=5.0,
             )
+            if status_q != 200 or not quota_json:
+                status_q, quota_json = _call_antigravity_local(
+                    port,
+                    "RetrieveUserQuotaSummary",
+                    {"forceRefresh": False},
+                    tokens,
+                    ssl_ctx,
+                    timeout=2.5,
+                )
             status_u, user_json = _call_antigravity_local(
                 port,
                 "GetUserStatus",
